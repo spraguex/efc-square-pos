@@ -2,7 +2,7 @@
 /*
 Plugin Name: Easy Farm Cart to Square Sync
 Description: Easy Farm Cart (Ecwid white-label) is the source of truth for title, description, and price. Automatically updates Square on product.updated. Inventory sync is bi-directional: Easy Farm Cart ↔ Square.
-Version: 1.10
+Version: 1.11
 Author: Your Name
 */
 
@@ -1330,9 +1330,13 @@ function ecwid_square_update_square_variation($square_token, $variation_id, $ecw
 
 /*
 |--------------------------------------------------------------------------
-| Square Inventory Helpers
+| Square Inventory Helpers (REPLACED ecwid_square_set_absolute_inventory)
 |--------------------------------------------------------------------------
 */
+
+/*
+ * START REPLACED FUNCTION (robust zeroing + improved logging)
+ */
 function ecwid_square_set_absolute_inventory($square_token, $variation_id, $location_id, $quantity, $debug = false) {
     if (empty($variation_id) || empty($location_id)) {
         ecwid_square_dbg("[Square] Inventory sync missing variation/location.", $debug, 'error');
@@ -1346,95 +1350,189 @@ function ecwid_square_set_absolute_inventory($square_token, $variation_id, $loca
     }
 
     $desired = max(0, intval($quantity));
-
     $current = ecwid_square_get_square_instock_count($square_token, $variation_id, $location_id);
-    if ($current !== false && intval($current) === $desired) {
-        ecwid_square_dbg("[Square] Inventory already $desired for variation $variation_id.", $debug, 'success');
+    if ($current !== false) $current = intval($current);
+
+    if ($current !== false && $current === $desired) {
+        ecwid_square_dbg("[Square] Inventory already $desired for variation $variation_id (noop).", $debug, 'success');
         ec2sq_log('info', 'ecwid->square', 'inventory_noop', ['variation_id' => $variation_id, 'location' => $location_id, 'qty' => $desired], null, null, $variation_id, $location_id);
         return true;
     }
 
-    $pc_change = [
-        'type' => 'PHYSICAL_COUNT',
-        'physical_count' => [
-            'catalog_object_id' => $variation_id,
-            'location_id' => $location_id,
-            'state' => 'IN_STOCK',
-            'quantity' => strval($desired),
-            'occurred_at' => gmdate('c'),
-            'reference_id' => 'ecwid-sync-' . substr($variation_id, -8)
-        ]
-    ];
-    $pc_body = [
-        'idempotency_key' => uniqid('ecwid2sq_bc_', true),
-        'changes' => [ $pc_change ]
-    ];
+    // Local helper to post inventory changes
+    $post_changes = function($changes, $tag) use ($square_token, $variation_id, $location_id, $debug) {
+        $body = [
+            'idempotency_key' => uniqid('ec2sq_inv_' . $tag . '_', true),
+            'changes' => $changes
+        ];
+        $resp = wp_remote_post('https://connect.squareup.com/v2/inventory/changes/batch-create', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $square_token,
+                'Content-Type' => 'application/json'
+            ],
+            'body' => json_encode($body),
+            'timeout' => 25
+        ]);
+        if (is_wp_error($resp)) {
+            ecwid_square_dbg("[Square][$tag] HTTP error: ".$resp->get_error_message(), $debug, 'error');
+            ec2sq_log('error', 'ecwid->square', 'inventory_'.$tag.'_http_error', ['error' => $resp->get_error_message(), 'body' => $body], null, null, $variation_id, $location_id);
+            return [false, 0, 'HTTP'];
+        }
+        $code = wp_remote_retrieve_response_code($resp);
+        $text = wp_remote_retrieve_body($resp);
+        if ($code >= 200 && $code < 300) {
+            ecwid_square_dbg("[Square][$tag] Applied successfully.", $debug, 'success');
+            ec2sq_log('info', 'ecwid->square', 'inventory_'.$tag.'_applied', ['variation_id' => $variation_id, 'location' => $location_id], null, null, $variation_id, $location_id);
+            return [true, $code, $text];
+        }
+        ecwid_square_dbg("[Square][$tag] Failed ($code).", $debug, 'error');
+        ec2sq_log('warn', 'ecwid->square', 'inventory_'.$tag.'_failed', ['code' => $code, 'resp' => $text, 'body' => $body], null, null, $variation_id, $location_id);
+        return [false, $code, $text];
+    };
 
-    $pc_resp = wp_remote_post('https://connect.squareup.com/v2/inventory/changes/batch-create', [
-        'headers' => [
-            'Authorization' => 'Bearer ' . $square_token,
-            'Content-Type' => 'application/json'
-        ],
-        'body' => json_encode($pc_body),
-        'timeout' => 25
-    ]);
-    if (is_wp_error($pc_resp)) {
-        ecwid_square_dbg("[Square] PHYSICAL_COUNT HTTP error: ".$pc_resp->get_error_message(), $debug, 'error');
-        ec2sq_log('error', 'ecwid->square', 'inventory_pc_http_error', ['error' => $pc_resp->get_error_message(), 'body' => $pc_body], null, null, $variation_id, $location_id);
+    // CASE A: Desired > 0 → use PHYSICAL_COUNT directly (absolute set)
+    if ($desired > 0) {
+        $pc_change = [
+            'type' => 'PHYSICAL_COUNT',
+            'physical_count' => [
+                'catalog_object_id' => $variation_id,
+                'location_id' => $location_id,
+                'state' => 'IN_STOCK',
+                'quantity' => strval($desired),
+                'occurred_at' => gmdate('c'),
+                'reference_id' => 'ecwid-sync-pc-' . substr($variation_id, -6)
+            ]
+        ];
+        [$ok] = $post_changes([$pc_change], 'pc');
+        if ($ok) {
+            set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => $desired, 'at' => time()], 120);
+            // Quick verification fetch
+            $verify = ecwid_square_get_square_instock_count($square_token, $variation_id, $location_id);
+            if ($verify !== false && intval($verify) !== $desired) {
+                ec2sq_log('warn', 'ecwid->square', 'inventory_pc_verify_mismatch', ['desired' => $desired, 'fetched' => $verify], null, null, $variation_id, $location_id);
+            }
+            return true;
+        }
+        // Fallback: try again after short sleep (Square transient errors)
+        sleep(1);
+        [$ok2] = $post_changes([$pc_change], 'pc_retry');
+        if ($ok2) {
+            set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => $desired, 'at' => time()], 120);
+            return true;
+        }
         return false;
     }
-    $pc_code = wp_remote_retrieve_response_code($pc_resp);
-    $pc_text = wp_remote_retrieve_body($pc_resp);
-    if ($pc_code >= 200 && $pc_code < 300) {
-        ecwid_square_dbg("[Square] PHYSICAL_COUNT applied ($desired).", $debug, 'success');
-        set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => $desired, 'at' => time()], 120);
-        ec2sq_log('info', 'ecwid->square', 'inventory_pc_applied', ['variation_id' => $variation_id, 'location' => $location_id, 'qty' => $desired], null, null, $variation_id, $location_id);
-        return true;
-    }
 
-    ecwid_square_dbg("[Square] PHYSICAL_COUNT failed; trying ADJUSTMENT. Response: $pc_text", $debug, 'error');
-    ec2sq_log('warn', 'ecwid->square', 'inventory_pc_failed', ['code' => $pc_code, 'resp' => $pc_text, 'body' => $pc_body], null, null, $variation_id, $location_id);
+    // CASE B: Desired == 0 → robust zeroing
+    // Strategy:
+    // 1. If current > 0 => ADJUSTMENT from IN_STOCK -> NONE quantity=current
+    // 2. Verify. If still >0, retry once.
+    // 3. If ADJUSTMENT path fails entirely, do PHYSICAL_COUNT to 0 with state IN_STOCK as last resort.
+    $current_for_zero = ($current !== false) ? $current : null;
 
-    $adj_change = [
-        'type' => 'ADJUSTMENT',
-        'adjustment' => [
-            'catalog_object_id' => $variation_id,
-            'location_id' => $location_id,
-            'from_state' => 'NONE',
-            'to_state' => 'IN_STOCK',
-            'quantity' => strval($desired),
-            'occurred_at' => gmdate('c'),
-            'reference_id' => 'ecwid-sync-adj-' . substr($variation_id, -8)
-        ]
-    ];
-    $adj_body = [
-        'idempotency_key' => uniqid('ecwid2sq_adj_', true),
-        'changes' => [ $adj_change ]
-    ];
-
-    $adj_resp = wp_remote_post('https://connect.squareup.com/v2/inventory/changes/batch-create', [
-        'headers' => [
-            'Authorization' => 'Bearer ' . $square_token,
-            'Content-Type' => 'application/json'
-        ],
-        'body' => json_encode($adj_body),
-        'timeout' => 25
-    ]);
-    if (is_wp_error($adj_resp)) {
-        ec2sq_log('error', 'ecwid->square', 'inventory_adj_http_error', ['error' => $adj_resp->get_error_message(), 'body' => $adj_body], null, null, $variation_id, $location_id);
+    if ($current_for_zero === null) {
+        // Couldn't fetch current reliably; attempt a PC to 0 (some Square accounts accept this).
+        ecwid_square_dbg("[Square][zero] Current unknown; applying PHYSICAL_COUNT 0 fallback.", $debug, 'info');
+        $pc0 = [
+            'type' => 'PHYSICAL_COUNT',
+            'physical_count' => [
+                'catalog_object_id' => $variation_id,
+                'location_id' => $location_id,
+                'state' => 'IN_STOCK',
+                'quantity' => '0',
+                'occurred_at' => gmdate('c'),
+                'reference_id' => 'ecwid-sync-pc0-' . substr($variation_id, -6)
+            ]
+        ];
+        [$pc_ok] = $post_changes([$pc0], 'pc_zero_unknown_current');
+        if ($pc_ok) {
+            set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => 0, 'at' => time()], 120);
+            return true;
+        }
         return false;
     }
-    $adj_code = wp_remote_retrieve_response_code($adj_resp);
-    $adj_text = wp_remote_retrieve_body($adj_resp);
-    if ($adj_code >= 200 && $adj_code < 300) {
-        ec2sq_log('info', 'ecwid->square', 'inventory_adj_applied', ['variation_id' => $variation_id, 'location' => $location_id, 'qty' => $desired], null, null, $variation_id, $location_id);
-        set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => $desired, 'at' => time()], 120);
+
+    if ($current_for_zero > 0) {
+        ecwid_square_dbg("[Square][zero] Reducing $current_for_zero → 0 via ADJUSTMENT IN_STOCK→NONE.", $debug, 'info');
+        $adj = [
+            'type' => 'ADJUSTMENT',
+            'adjustment' => [
+                'catalog_object_id' => $variation_id,
+                'location_id' => $location_id,
+                'from_state' => 'IN_STOCK',
+                'to_state' => 'NONE',
+                'quantity' => strval($current_for_zero),
+                'occurred_at' => gmdate('c'),
+                'reference_id' => 'ecwid-sync-zero-' . substr($variation_id, -6)
+            ]
+        ];
+        [$adj_ok] = $post_changes([$adj], 'zero_adj');
+        if ($adj_ok) {
+            // Verify after a brief delay (Square propagation)
+            usleep(300000); // 0.3s
+            $verify1 = ecwid_square_get_square_instock_count($square_token, $variation_id, $location_id);
+            if ($verify1 !== false && intval($verify1) > 0) {
+                ec2sq_log('warn', 'ecwid->square', 'inventory_zero_verify_still_positive', ['verify' => $verify1, 'attempt' => 1], null, null, $variation_id, $location_id);
+                // Second verification with a re-fetch after slight delay
+                usleep(500000);
+                $verify2 = ecwid_square_get_square_instock_count($square_token, $variation_id, $location_id);
+                if ($verify2 !== false && intval($verify2) > 0) {
+                    ec2sq_log('warn', 'ecwid->square', 'inventory_zero_verify_still_positive', ['verify' => $verify2, 'attempt' => 2], null, null, $variation_id, $location_id);
+                    // Fallback: apply PHYSICAL_COUNT 0
+                    $pc0 = [
+                        'type' => 'PHYSICAL_COUNT',
+                        'physical_count' => [
+                            'catalog_object_id' => $variation_id,
+                            'location_id' => $location_id,
+                            'state' => 'IN_STOCK',
+                            'quantity' => '0',
+                            'occurred_at' => gmdate('c'),
+                            'reference_id' => 'ecwid-sync-pc0fb-' . substr($variation_id, -6)
+                        ]
+                    ];
+                    [$pc_ok] = $post_changes([$pc0], 'pc_zero_fallback');
+                    if ($pc_ok) {
+                        set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => 0, 'at' => time()], 120);
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => 0, 'at' => time()], 120);
+            ec2sq_log('info', 'ecwid->square', 'inventory_zero_success', ['variation_id' => $variation_id, 'location' => $location_id], null, null, $variation_id, $location_id);
+            return true;
+        } else {
+            ecwid_square_dbg("[Square][zero] ADJUSTMENT failed, fallback PHYSICAL_COUNT 0.", $debug, 'error');
+            $pc0 = [
+                'type' => 'PHYSICAL_COUNT',
+                'physical_count' => [
+                    'catalog_object_id' => $variation_id,
+                    'location_id' => $location_id,
+                    'state' => 'IN_STOCK',
+                    'quantity' => '0',
+                    'occurred_at' => gmdate('c'),
+                    'reference_id' => 'ecwid-sync-pc0-alt-' . substr($variation_id, -6)
+                ]
+            ];
+            [$pc_ok] = $post_changes([$pc0], 'pc_zero_after_adj_fail');
+            if ($pc_ok) {
+                set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => 0, 'at' => time()], 120);
+                return true;
+            }
+            return false;
+        }
+    } else {
+        // current already 0 (but earlier equality check failed because maybe fetch failed once)
+        ecwid_square_dbg("[Square][zero] Current already 0 (treat as noop).", $debug, 'success');
+        ec2sq_log('info', 'ecwid->square', 'inventory_zero_already', ['variation_id' => $variation_id, 'location' => $location_id], null, null, $variation_id, $location_id);
+        set_transient('ec2sq_last_sq_set_' . $variation_id, ['qty' => 0, 'at' => time()], 120);
         return true;
     }
-
-    ec2sq_log('error', 'ecwid->square', 'inventory_adj_failed', ['code' => $adj_code, 'resp' => $adj_text, 'body' => $adj_body], null, null, $variation_id, $location_id);
-    return false;
 }
+/*
+ * END REPLACED FUNCTION
+ */
+
 
 function ecwid_square_get_square_instock_count($square_token, $variation_id, $location_id) {
     $count_url = "https://connect.squareup.com/v2/inventory/counts?catalog_object_ids=" . urlencode($variation_id) . "&location_ids=" . urlencode($location_id);
