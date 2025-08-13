@@ -1,14 +1,14 @@
 <?php
 /*
 Plugin Name: Easy Farm Cart to Square Sync
-Description: Easy Farm Cart (Ecwid white-label) is the source of truth for title, description, and price. Automatically updates Square on product.updated. Inventory sync is bi-directional: Easy Farm Cart orders + product.updated push to Square; Square inventory.count.updated pushes to Easy Farm Cart. Includes enhanced diagnostics, per-SKU lookup, persistent logs, conflict protection, presence/tracking enforcement, and anti-zero logic for Square→Easy Farm Cart.
-Version: 1.1.0
+Description: Easy Farm Cart (Ecwid white-label) is the source of truth for title, description, and price. Automatically updates Square on product.updated. Inventory sync is bi-directional: Easy Farm Cart ↔ Square.
+Version: 1.10
 Author: Your Name
 */
 
 if (!defined('ABSPATH')) exit;
 
-if (!defined('EC2SQ_VERSION')) define('EC2SQ_VERSION', '1.1.0');
+if (!defined('EC2SQ_VERSION')) define('EC2SQ_VERSION', '1.10');
 if (!defined('EC2SQ_PLUGIN_TITLE')) define('EC2SQ_PLUGIN_TITLE', 'Easy Farm Cart ↔ Square Sync');
 
 /*
